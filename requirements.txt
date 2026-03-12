@@ -1,4 +1,4 @@
 streamlit
 pandas
-mistralai
+mistralai>=1.0.0
 openpyxl
