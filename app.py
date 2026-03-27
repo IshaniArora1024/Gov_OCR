@@ -5,7 +5,9 @@ import base64
 import io
 import re
 import time
+import random
 from mistralai import Mistral
+
 MISTRAL_API_KEY = st.secrets["MISTRAL_API_KEY"]
 
 st.set_page_config(page_title="Notify Me — Cause List Extractor", page_icon="⚖️", layout="wide")
@@ -98,7 +100,6 @@ CASE_NO_RE = re.compile(
     re.IGNORECASE
 )
 
-# Filters out IA sub-items
 def get_main_case_nums(text: str) -> list[str]:
     return [
         m.group() for m in CASE_NO_RE.finditer(text)
@@ -163,58 +164,74 @@ RULES:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ADAPTIVE EXTRACTION ENGINE
-#
-# Phase 1 — Fast path: group 2 pages per call using mistral-small
-#            Target: ~2-3x faster than v4, same accuracy on clean layouts
-#
-# Phase 2 — Upgrade path: triggered per-page only when Phase 1 yield is low
-#            (<80% of case numbers found by regex vs extracted by LLM)
-#            Uses mistral-large + reconciliation call for that specific page only
-#
-# Result: clean pages finish in ~1 sec each (small model, 2-page batches)
-#         only messy pages pay the large model + reconciliation cost
 # ══════════════════════════════════════════════════════════════════════════════
 
 SMALL_MODEL = "mistral-small-latest"
 LARGE_MODEL = "mistral-large-latest"
-ACCURACY_THRESHOLD = 0.80   # upgrade if extracted < 80% of regex-found case nums
+ACCURACY_THRESHOLD = 0.80
+
+# ── RETRY CONFIG ──────────────────────────────────────────────────────────────
+MAX_RETRIES   = 6          # max attempts per call
+BASE_WAIT     = 2.0        # seconds for first retry
+MAX_WAIT      = 64.0       # cap on wait time
+BATCH_DELAY   = 1.5        # polite pause between every batch call (seconds)
 
 
-def call_llm(client, model: str, pages_text: str, court: str, label: str) -> list[dict]:
-    """Single LLM call. Returns parsed list of case dicts."""
-    try:
-        resp = client.chat.complete(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": f"Court: {court}\n{label}\n\n{pages_text}"}
-            ],
-            temperature=0.0,
-            max_tokens=5000
-        )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"```json\s*|```", "", raw).strip()
+def call_llm(client, model: str, pages_text: str, court: str, label: str,
+             retries: int = MAX_RETRIES) -> list[dict]:
+    """
+    Single LLM call with exponential backoff + jitter on 429 Rate Limit errors.
+    Retries up to `retries` times before giving up and returning [].
+    """
+    for attempt in range(retries):
         try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            m = re.search(r'\[.*\]', raw, re.DOTALL)
-            parsed = json.loads(m.group()) if m else []
-        if isinstance(parsed, dict):
-            parsed = [parsed]
-        return parsed if isinstance(parsed, list) else []
-    except Exception as e:
-        st.warning(f"LLM call failed ({label}): {str(e)[:100]}")
-        return []
+            resp = client.chat.complete(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": f"Court: {court}\n{label}\n\n{pages_text}"}
+                ],
+                temperature=0.0,
+                max_tokens=5000
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = re.sub(r"```json\s*|```", "", raw).strip()
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                m = re.search(r'\[.*\]', raw, re.DOTALL)
+                parsed = json.loads(m.group()) if m else []
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            return parsed if isinstance(parsed, list) else []
+
+        except Exception as e:
+            err_str = str(e)
+            is_rate_limit = "429" in err_str or "rate limit" in err_str.lower()
+
+            if is_rate_limit and attempt < retries - 1:
+                # Exponential backoff with full jitter
+                wait = min(BASE_WAIT * (2 ** attempt) + random.uniform(0, 1), MAX_WAIT)
+                st.warning(
+                    f"⏳ Rate limit hit on **{label}** "
+                    f"(attempt {attempt + 1}/{retries}). "
+                    f"Retrying in **{wait:.1f}s**..."
+                )
+                time.sleep(wait)
+                continue
+
+            # Non-rate-limit error or exhausted retries
+            st.warning(f"LLM call failed ({label}): {err_str[:120]}")
+            return []
+
+    st.warning(f"LLM call gave up after {retries} retries ({label}).")
+    return []
 
 
 def extraction_accuracy(page_text: str, cases: list[dict]) -> float:
-    """
-    Returns ratio: extracted case nums / regex-found case nums on page.
-    1.0 = perfect. Below ACCURACY_THRESHOLD = needs upgrade.
-    """
     found_on_page = set(cn.upper() for cn in get_main_case_nums(page_text))
     if not found_on_page:
-        return 1.0   # no case numbers detectable by regex → can't measure, assume OK
+        return 1.0
     extracted = set(
         str(c.get("case_number") or "").strip().upper()
         for c in cases if c.get("case_number")
@@ -225,10 +242,6 @@ def extraction_accuracy(page_text: str, cases: list[dict]) -> float:
 
 def reconcile_page(client, page_text: str, cases: list[dict],
                    court: str, page_num: int) -> list[dict]:
-    """
-    Called only when large-model extraction still has gaps.
-    Targeted: tells the model exactly which case numbers are missing.
-    """
     found_on_page = set(cn.upper() for cn in get_main_case_nums(page_text))
     extracted_nums = set(
         str(c.get("case_number") or "").strip().upper()
@@ -245,31 +258,37 @@ def reconcile_page(client, page_text: str, cases: list[dict],
         f"\n\nFind each one in the page text below and return ONLY the missing entries as a JSON array.\n\n"
         f"Page text:\n{page_text}"
     )
-    try:
-        resp = client.chat.complete(
-            model=LARGE_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt}
-            ],
-            temperature=0.0,
-            max_tokens=2000
-        )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"```json\s*|```", "", raw).strip()
-        recovered = json.loads(raw) if raw.startswith('[') else []
-        if isinstance(recovered, list):
-            cases = cases + recovered
-    except Exception:
-        pass
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = client.chat.complete(
+                model=LARGE_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": prompt}
+                ],
+                temperature=0.0,
+                max_tokens=2000
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = re.sub(r"```json\s*|```", "", raw).strip()
+            recovered = json.loads(raw) if raw.startswith('[') else []
+            if isinstance(recovered, list):
+                cases = cases + recovered
+            break
+        except Exception as e:
+            err_str = str(e)
+            is_rate_limit = "429" in err_str or "rate limit" in err_str.lower()
+            if is_rate_limit and attempt < MAX_RETRIES - 1:
+                wait = min(BASE_WAIT * (2 ** attempt) + random.uniform(0, 1), MAX_WAIT)
+                st.warning(f"⏳ Rate limit on reconcile page {page_num} — retrying in {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+            break
     return cases
 
 
 def adaptive_extract(client, page_texts: list[str], court: str,
-                     progress_bar, status_el) -> tuple[list[dict], list[dict]]:
-    """
-    Returns (all_cases, page_stats) where page_stats is for the debug table.
-    """
+                     progress_bar, status_el) -> tuple[list[dict], list[dict], int]:
     all_cases  = []
     page_stats = []
 
@@ -277,7 +296,7 @@ def adaptive_extract(client, page_texts: list[str], court: str,
     PAGE_BATCH = 2
     batches = [page_texts[i:i+PAGE_BATCH] for i in range(0, len(page_texts), PAGE_BATCH)]
 
-    page_results = {}   # page_index → list[dict]
+    page_results = {}
 
     for b_idx, batch in enumerate(batches):
         pct = 32 + int(((b_idx + 1) / len(batches)) * 40)
@@ -291,22 +310,21 @@ def adaptive_extract(client, page_texts: list[str], court: str,
             unsafe_allow_html=True
         )
 
-        batch_text   = "\n\n--- PAGE BREAK ---\n\n".join(batch)
-        label        = f"Pages {first_page}–{last_page}"
-        batch_cases  = call_llm(client, SMALL_MODEL, batch_text, court, label)
+        batch_text  = "\n\n--- PAGE BREAK ---\n\n".join(batch)
+        label       = f"Pages {first_page}–{last_page}"
+        batch_cases = call_llm(client, SMALL_MODEL, batch_text, court, label)
 
-        # Assign extracted cases back to individual pages by serial/case proximity
-        # Simple approach: split cases roughly by page break marker count
+        # Polite pause between batch calls to avoid hammering rate limits
+        time.sleep(BATCH_DELAY)
+
         for i, page_text in enumerate(batch):
             page_idx = b_idx * PAGE_BATCH + i
-            # Cases that mention case numbers found on this page
             page_case_nums = set(cn.upper() for cn in get_main_case_nums(page_text))
             if page_case_nums:
                 page_cases = [
                     c for c in batch_cases
                     if str(c.get("case_number") or "").upper() in page_case_nums
                 ]
-                # Any cases with null case_number: assign to first page of batch
                 if i == 0:
                     null_cases = [c for c in batch_cases if not c.get("case_number")]
                     page_cases = page_cases + null_cases
@@ -332,26 +350,26 @@ def adaptive_extract(client, page_texts: list[str], court: str,
                 f'(accuracy {accuracy:.0%} → retrying with large model)',
                 unsafe_allow_html=True
             )
-            # Re-extract with large model
             upgraded = call_llm(client, LARGE_MODEL, page_text, court,
                                  f"Page {page_idx+1}")
-            upgraded_accuracy = extraction_accuracy(page_text, upgraded)
+            # Polite pause after large model call too
+            time.sleep(BATCH_DELAY)
 
-            # Reconcile if still gaps
+            upgraded_accuracy = extraction_accuracy(page_text, upgraded)
             if upgraded_accuracy < ACCURACY_THRESHOLD:
                 upgraded = reconcile_page(client, page_text, upgraded,
                                           court, page_idx + 1)
+                time.sleep(BATCH_DELAY)
 
             page_results[page_idx] = upgraded
 
-        # Build stats
-        final_cases   = page_results.get(page_idx, [])
+        final_cases    = page_results.get(page_idx, [])
         final_accuracy = extraction_accuracy(page_text, final_cases)
         page_stats.append({
-            "page":      page_idx + 1,
-            "cases":     len(final_cases),
-            "accuracy":  f"{final_accuracy:.0%}",
-            "model":     "large+reconcile" if accuracy < ACCURACY_THRESHOLD else "small",
+            "page":     page_idx + 1,
+            "cases":    len(final_cases),
+            "accuracy": f"{final_accuracy:.0%}",
+            "model":    "large+reconcile" if accuracy < ACCURACY_THRESHOLD else "small",
         })
         all_cases.extend(page_results.get(page_idx, []))
 
@@ -422,7 +440,7 @@ with st.sidebar:
     ✓ Phase 2 — mistral-large<br>
     &nbsp;&nbsp;only on low-accuracy pages<br>
     ✓ Reconciliation only if needed<br>
-    ✓ No layout preprocessing<br>
+    ✓ Exponential backoff on 429<br>
     ✓ Works on all court layouts<br><br>
     TYPICAL SPEED<br>
     ✓ Clean PDF: ~45–90 sec<br>
@@ -465,7 +483,6 @@ with col_info:
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-# ── Button row: Extract + Clear ───────────────────────────────────────────────
 btn_col, clear_col = st.columns([3, 1])
 with btn_col:
     process_btn = st.button("⚡  Extract All Cases", use_container_width=True)
@@ -475,7 +492,6 @@ with clear_col:
             st.session_state.pop(k, None)
         st.rerun()
 
-# ── Run extraction only when button pressed — store everything in session_state
 if process_btn:
     if not uploaded_file:
         st.warning("Please upload a cause list first.")
@@ -518,14 +534,13 @@ if process_btn:
             status.empty()
             progress.empty()
 
-            # ── Save everything to session_state — no re-run will re-call APIs
             st.session_state["results"] = {
-                "final_cases":     final_cases,
-                "df":              df,
-                "page_stats":      page_stats,
-                "detected_court":  detected_court,
-                "elapsed":         elapsed,
-                "upgrades":        upgrades,
+                "final_cases":    final_cases,
+                "df":             df,
+                "page_stats":     page_stats,
+                "detected_court": detected_court,
+                "elapsed":        elapsed,
+                "upgrades":       upgrades,
             }
             st.session_state["page_texts"] = page_texts
             st.session_state["fname"]      = uploaded_file.name.rsplit(".", 1)[0]
@@ -535,17 +550,16 @@ if process_btn:
             import traceback
             st.code(traceback.format_exc())
 
-# ── Render results from session_state (survives all button clicks / downloads)
 if "results" in st.session_state:
-    r          = st.session_state["results"]
-    df         = r["df"]
-    final_cases= r["final_cases"]
-    page_stats = r["page_stats"]
-    court      = r["detected_court"]
-    elapsed    = r["elapsed"]
-    upgrades   = r["upgrades"]
-    page_texts = st.session_state.get("page_texts", [])
-    fname      = st.session_state.get("fname", "extracted")
+    r           = st.session_state["results"]
+    df          = r["df"]
+    final_cases = r["final_cases"]
+    page_stats  = r["page_stats"]
+    court       = r["detected_court"]
+    elapsed     = r["elapsed"]
+    upgrades    = r["upgrades"]
+    page_texts  = st.session_state.get("page_texts", [])
+    fname       = st.session_state.get("fname", "extracted")
 
     if df.empty:
         st.warning("No cases found.")
